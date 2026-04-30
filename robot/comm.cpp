@@ -5,8 +5,8 @@
 #include <WiFi.h>
 #include "secrets.h"
 
-static const char* SSID     = WIFI_SSID;
-static const char* PASSWORD = WIFI_PASSWORD;
+static const char* SSID     = 2975 Wash 2;
+static const char* PASSWORD = Washroomates;
 
 static WiFiServer server(1234);
 static WiFiClient client;

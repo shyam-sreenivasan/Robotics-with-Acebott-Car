@@ -1,4 +1,4 @@
 #pragma once
 
 void motorInit();
-void motorMove(int dir, int speed);
+void motorMove(byte dir, int speed);

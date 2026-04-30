@@ -10,8 +10,8 @@ static const int M4_F = 32,  M4_B = 16;
 
 static float v_smooth = 0;
 static float w_smooth = 0;
-static const float ALPHA = 0.2f;
-static const float DEADBAND = 0.05f;
+static const float ALPHA = 1.0f;    // no smoothing, instant response
+static const float DEADBAND = 0.01f; // lower threshold
 
 void motionInit() {
   motorMove(0, 0);
