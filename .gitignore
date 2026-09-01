@@ -1,1 +1,9 @@
 robot/secrets.h
+
+# Sensor telemetry captured during runs
+sensor-log-*.csv
+roam-log-*.csv
+
+# Python
+venv/
+__pycache__/
