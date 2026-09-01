@@ -1,4 +1,13 @@
 #include "comm.h"
+#include "servo.h"
+
+// Lines starting with "S," aim the sensor servo instead of setting velocity.
+// Returns true if the line was a servo command and has been handled.
+static bool handleServoCmd(const String &msg) {
+  if (!msg.startsWith("S,")) return false;
+  servoWrite(msg.substring(2).toInt());
+  return true;
+}
 
 #ifdef COMM_WIFI
 
@@ -32,12 +41,20 @@ bool commRead(float &v, float &w) {
   if (!client.available()) return false;
 
   String msg = client.readStringUntil('\n');
+  if (handleServoCmd(msg)) return false;  // not a velocity update
+
   int comma = msg.indexOf(',');
   if (comma <= 0) return false;
 
   v = msg.substring(0, comma).toFloat();
   w = msg.substring(comma + 1).toFloat();
   return true;
+}
+
+void commWrite(const String &line) {
+  if (client && client.connected()) {
+    client.println(line);
+  }
 }
 
 #else  // Serial
@@ -52,12 +69,18 @@ bool commRead(float &v, float &w) {
   if (!Serial.available()) return false;
 
   String msg = Serial.readStringUntil('\n');
+  if (handleServoCmd(msg)) return false;  // not a velocity update
+
   int comma = msg.indexOf(',');
   if (comma <= 0) return false;
 
   v = msg.substring(0, comma).toFloat();
   w = msg.substring(comma + 1).toFloat();
   return true;
+}
+
+void commWrite(const String &line) {
+  Serial.println(line);
 }
 
 #endif

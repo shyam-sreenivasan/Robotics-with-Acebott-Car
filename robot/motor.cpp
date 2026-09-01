@@ -9,7 +9,7 @@ void motorInit() {
   pinMode(19, OUTPUT);
 }
 
-void motorMove(int dir, int speed) {
+void motorMove(byte dir, int speed) {
   digitalWrite(16, LOW);
   analogWrite(19, speed);
 
