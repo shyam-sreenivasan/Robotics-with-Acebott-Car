@@ -7,3 +7,11 @@ roam-log-*.csv
 # Python
 venv/
 __pycache__/
+
+# YOLO weights: re-downloaded automatically on first run
+*.pt
+
+# colcon build output (the package is built from ~/sensorstream_ws)
+build/
+install/
+log/

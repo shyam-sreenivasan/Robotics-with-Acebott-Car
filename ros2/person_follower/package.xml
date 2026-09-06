@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>person_follower</name>
+  <version>0.1.0</version>
+  <description>Person detection, tracking and following for the ACEBOTT car</description>
+  <maintainer email="sreenivasan.sh@northeastern.edu">Shyam Sreenivasan</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
