@@ -66,7 +66,32 @@ CORRECTION_W = -0.5      # negative = left; use when the car drifts right
 CORRECTION_PULSE_S = 0.06
 
 REVERSE_S = 0.7          # how long to back up after hitting an obstacle
-SERVO_SETTLE_S = 0.35    # let the head stop moving before trusting a reading
+
+# Must exceed 3 telemetry intervals (3 x 100ms) or the median filter will
+# still hold readings taken at the previous servo angle, blurring the two
+# sides together and making the scan near-useless.
+SERVO_SETTLE_S = 0.5
+
+# Ultrasonic timeout distance. A no-echo reading means "nothing in range",
+# which for scanning purposes is the clearest possible direction.
+MAX_RANGE_CM = 400.0
+
+# Treat two scan readings closer than this as a tie.
+SCAN_MARGIN_CM = 10.0
+
+# ---------------- continuous sweep ----------------
+# While driving, the sensor head sweeps back and forth instead of staring
+# straight ahead, so the car builds a picture of what is beside it.
+SWEEP_ENABLED = True
+SWEEP_MIN_DEG = 50
+SWEEP_MAX_DEG = 130
+SWEEP_STEP_DEG = 20      # bigger steps = faster sweep, coarser picture
+SWEEP_INTERVAL_S = 0.25  # how often to advance the head one step
+
+# Only readings taken within this many degrees of straight-ahead are
+# allowed to trigger the forward-obstacle stop. A wall 60 degrees off to
+# the side is not in the car's path and must not brake it.
+FORWARD_ARC_DEG = 25
 
 # Stay in manual this long after the last keypress before auto resumes.
 RESUME_DELAY_S = 1.5
@@ -86,6 +111,7 @@ class Telemetry:
         self.sock = sock
         self.latest = None
         self.recent = []          # last few distances, for median filtering
+        self.by_angle = {}        # servo angle -> (distance_cm, timestamp)
         self.running = True
         self.lock = threading.Lock()
         self.rows = []
@@ -135,6 +161,11 @@ class Telemetry:
                     if row["distance_cm"] > 0:
                         self.recent.append(row["distance_cm"])
                         del self.recent[:-3]
+                        # Keep the newest reading for each servo angle, so a
+                        # sweep builds up a picture of the surroundings
+                        # instead of just overwriting one number.
+                        self.by_angle[row["servo_deg"]] = (
+                            row["distance_cm"], row["host_time"])
 
     def distance(self):
         """Median of the last 3 valid readings, or None if we have none yet.
@@ -146,6 +177,30 @@ class Telemetry:
             if not self.recent:
                 return None
             return sorted(self.recent)[len(self.recent) // 2]
+
+    def at_angle(self, deg, tolerance=15, max_age=3.0):
+        """Best recent reading near a servo angle, or None.
+
+        Sweep readings go stale as the car moves, so anything older than
+        max_age seconds is ignored rather than trusted.
+        """
+        now = time.time()
+        best = None
+        with self.lock:
+            for angle, (dist, ts) in self.by_angle.items():
+                if abs(angle - deg) <= tolerance and now - ts <= max_age:
+                    if best is None or dist < best:
+                        best = dist       # nearest obstacle in that arc
+        return best
+
+    def flush(self):
+        """Drop buffered readings, e.g. after moving the servo.
+
+        Without this the median would mix distances taken at two different
+        angles, which is exactly the wrong answer during a scan.
+        """
+        with self.lock:
+            self.recent.clear()
 
     def stop(self):
         self.running = False
@@ -170,6 +225,31 @@ class ManualOverride(Exception):
     """Raised inside hold() so the autonomous behaviour unwinds immediately."""
 
 
+class Paused(Exception):
+    """Raised inside hold() when the user hits the pause key."""
+
+
+class ToggleKey:
+    """Edge-triggered key, so holding it down toggles exactly once.
+
+    keyboard.is_pressed() stays true for the whole press, which would
+    otherwise flip the state on every poll.
+    """
+
+    def __init__(self, key):
+        self.key = key
+        self.was_down = False
+
+    def pressed(self):
+        down = keyboard.is_pressed(self.key)
+        fired = down and not self.was_down
+        self.was_down = down
+        return fired
+
+
+pause_key = ToggleKey("space")
+
+
 class Roamer:
     def __init__(self, sock, telem):
         self.sock = sock
@@ -177,6 +257,8 @@ class Roamer:
         self.servo_deg = SERVO_CENTER
         self.stats = {"straight": 0, "turn": 0, "spin": 0,
                       "avoid": 0, "manual": 0}
+        self.sweep_dir = 1          # +1 sweeping toward SWEEP_MAX_DEG
+        self.next_sweep = 0.0
 
     # ---------------- low-level output ----------------
 
@@ -187,6 +269,33 @@ class Roamer:
         if deg != self.servo_deg:
             self.sock.send(f"S,{deg}\n".encode())
             self.servo_deg = deg
+            # Readings taken at the old angle no longer describe what the
+            # sensor is pointing at.
+            self.telem.flush()
+
+    def sweep_step(self):
+        """Advance the sweeping head one step, if it is time.
+
+        Called from the driving loop so the head keeps moving while the car
+        drives, rather than only during a dedicated scan.
+        """
+        if not SWEEP_ENABLED or time.time() < self.next_sweep:
+            return
+        deg = self.servo_deg + self.sweep_dir * SWEEP_STEP_DEG
+        if deg >= SWEEP_MAX_DEG:
+            deg, self.sweep_dir = SWEEP_MAX_DEG, -1
+        elif deg <= SWEEP_MIN_DEG:
+            deg, self.sweep_dir = SWEEP_MIN_DEG, 1
+        self.aim(deg)
+        self.next_sweep = time.time() + SWEEP_INTERVAL_S
+
+    def forward_distance(self):
+        """Nearest obstacle within the forward arc, ignoring side readings.
+
+        With the head sweeping, telem.distance() would mix in walls off to
+        the side and brake the car for things it is not driving into.
+        """
+        return self.telem.at_angle(SERVO_CENTER, tolerance=FORWARD_ARC_DEG)
 
     def hold(self, v, w, seconds, watch_obstacle=True, correct_drift=True):
         """Drive at (v, w) for a while, refreshing the firmware watchdog.
@@ -201,6 +310,8 @@ class Roamer:
         while time.time() < end:
             if keyboard.is_pressed("q"):
                 raise KeyboardInterrupt
+            if pause_key.pressed():
+                raise Paused
             if manual_input():
                 raise ManualOverride
 
@@ -216,9 +327,14 @@ class Roamer:
                     time.sleep(0.02)
                 next_correction = time.time() + 1.0 / DRIFT_TRIM
 
+            # Keep the head sweeping while we drive, but hold it still
+            # during a deliberate turn so the readings stay interpretable.
+            if w == 0.0:
+                self.sweep_step()
+
             self.drive(v, w)
             if watch_obstacle and v > 0:
-                d = self.telem.distance()
+                d = self.forward_distance()
                 if d is not None and d < OBSTACLE_CM:
                     return False
             time.sleep(0.05)
@@ -237,22 +353,34 @@ class Roamer:
     def scan(self):
         """Look left and right, return (left_cm, right_cm).
 
-        Falls back to 0.0 for a side that reads out of range, which is a lie
-        in the safe direction -- we'd rather under-estimate clearance.
+        An out-of-range echo means nothing is within the sensor's ~4m
+        range, i.e. that direction is completely clear -- so it maps to
+        MAX_RANGE_CM, not 0. Treating it as 0 made wide-open sides look
+        like walls and was a major cause of the car always turning right.
         """
         self.drive(0.0, 0.0)
+        # Suspend the sweep: this scan aims the head deliberately and must
+        # not have sweep_step() moving it between reading and decision.
+        self.next_sweep = time.time() + 10.0
 
         self.aim(SERVO_LEFT)
         self._settle()
-        left = self.telem.distance() or 0.0
+        left = self._scan_reading()
 
         self.aim(SERVO_RIGHT)
         self._settle()
-        right = self.telem.distance() or 0.0
+        right = self._scan_reading()
 
         self.aim(SERVO_CENTER)
         self._settle()
         return left, right
+
+    def _scan_reading(self):
+        """Distance at the current servo angle, with no-echo meaning 'clear'."""
+        d = self.telem.distance()
+        if d is None or d <= 0:
+            return MAX_RANGE_CM
+        return d
 
     def _settle(self):
         """Wait for the servo to stop moving, staying responsive to the user.
@@ -264,6 +392,8 @@ class Roamer:
         while time.time() < end:
             if keyboard.is_pressed("q"):
                 raise KeyboardInterrupt
+            if pause_key.pressed():
+                raise Paused
             if manual_input():
                 raise ManualOverride
             self.drive(0.0, 0.0)   # hold still and feed the watchdog
@@ -281,9 +411,17 @@ class Roamer:
         self.drive(0.0, 0.0)
 
         left, right = self.scan()
-        direction = -1 if left > right else 1
+        # Only prefer a side when it is meaningfully more open. Within the
+        # sensor's own noise the two readings say nothing useful, so pick at
+        # random rather than letting a tie always fall the same way.
+        if abs(left - right) < SCAN_MARGIN_CM:
+            direction = random.choice([-1, 1])
+            why = "similar, picking randomly"
+        else:
+            direction = -1 if left > right else 1
+            why = "clearer side"
         side = "left" if direction < 0 else "right"
-        print(f"  left={left:.0f}cm right={right:.0f}cm -> turning {side}")
+        print(f"  left={left:.0f}cm right={right:.0f}cm -> turning {side} ({why})")
 
         self.turn_for(random.uniform(60, 120), direction)
 
@@ -301,6 +439,9 @@ class Roamer:
         while True:
             if keyboard.is_pressed("q"):
                 raise KeyboardInterrupt
+            if pause_key.pressed():
+                self.drive(0.0, 0.0)
+                raise Paused
 
             cmd = manual_input()
             if cmd:
@@ -325,6 +466,34 @@ class Roamer:
         self.aim(SERVO_CENTER)
         print("  [AUTO] resuming")
 
+    def paused_loop(self):
+        """Sit still until the user unpauses.
+
+        Manual driving still works while paused -- handy for repositioning
+        the car before letting it loose again.
+        """
+        print("\n  [PAUSED] space resumes, WASD still drives, Q quits")
+        while True:
+            if keyboard.is_pressed("q"):
+                raise KeyboardInterrupt
+            if pause_key.pressed():
+                break
+
+            cmd = manual_input()
+            self.drive(*cmd) if cmd else self.drive(0.0, 0.0)
+
+            if keyboard.is_pressed("j"):
+                self.aim(min(180, self.servo_deg + 3))
+            elif keyboard.is_pressed("l"):
+                self.aim(max(0, self.servo_deg - 3))
+            elif keyboard.is_pressed("k"):
+                self.aim(SERVO_CENTER)
+
+            time.sleep(0.05)
+
+        self.drive(0.0, 0.0)
+        print("  [RUNNING] resumed")
+
     def step(self):
         """One decision: mostly go straight, sometimes turn."""
         roll = random.random()
@@ -334,7 +503,7 @@ class Roamer:
             duration = random.uniform(STRAIGHT_MIN_S, STRAIGHT_MAX_S)
             # Ease off the throttle when something is ahead but not yet close
             # enough to count as an obstacle.
-            d = self.telem.distance()
+            d = self.forward_distance()
             speed = CRUISE_SPEED
             if d is not None and d < CAUTION_CM:
                 speed = CRUISE_SPEED * 0.6
@@ -395,9 +564,11 @@ def main():
     sock.connect((ESP_IP, PORT))
     print(f"Connected to {ESP_IP}:{PORT}")
     print(f"Obstacle threshold: {OBSTACLE_CM:.0f}cm.")
-    print("WASD takes manual control at any time (auto resumes "
-          f"{RESUME_DELAY_S}s after you let go).")
-    print("JKL aim the sensor head while in manual.  Q stops.\n")
+    print("SPACE  start / pause roaming")
+    print("WASD   manual control at any time (auto resumes "
+          f"{RESUME_DELAY_S}s after you let go)")
+    print("JKL    aim the sensor head")
+    print("Q      stop and save the log\n")
 
     telem = Telemetry(sock)
     telem.start()
@@ -423,6 +594,8 @@ def main():
     roamer = Roamer(sock, telem)
     try:
         roamer.aim(SERVO_CENTER)
+        # Start paused so the car doesn't drive off the moment you hit enter.
+        roamer.paused_loop()
         while True:
             if keyboard.is_pressed("q"):
                 break
@@ -430,7 +603,13 @@ def main():
                 roamer.step()
             except ManualOverride:
                 # Abandon whatever the roamer was doing and hand over.
-                roamer.manual_drive()
+                # Pausing from inside manual control lands here too.
+                try:
+                    roamer.manual_drive()
+                except Paused:
+                    roamer.paused_loop()
+            except Paused:
+                roamer.paused_loop()
     except KeyboardInterrupt:
         pass
     finally:

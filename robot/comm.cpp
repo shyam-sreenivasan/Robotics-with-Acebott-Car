@@ -21,12 +21,26 @@ static WiFiServer server(1234);
 static WiFiClient client;
 
 void commInit() {
-  WiFi.begin(SSID, PASSWORD);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);   // clear any stored config from a previous mode
+
   Serial.print("Connecting WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  WiFi.begin(SSID, PASSWORD);
+
+  // Don't block forever: a wrong credential used to hang here with no
+  // feedback, and the car ignores every command until this returns.
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
     delay(500);
     Serial.print(".");
   }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi FAILED. Check credentials in secrets.h.");
+    Serial.println("Continuing anyway -- the car will not accept commands.");
+    return;
+  }
+
   Serial.println("\nConnected!");
   Serial.println(WiFi.localIP());
   server.begin();
