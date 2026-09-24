@@ -118,10 +118,11 @@ pip install -r requirements.txt
 
 ### Keyboard control over WiFi
 
-Edit `keyboard-wifi-control.py` and set `ESP_IP` to the IP shown in Serial Monitor, then:
+Set `ESP_IP` in `keyboard-wifi-control.py` to the robot's current address
+(`./venv/bin/python find-robot.py` will find it), then:
 
 ```bash
-python keyboard-wifi-control.py
+sudo ./venv/bin/python keyboard-wifi-control.py
 ```
 
 ### Keyboard control over Serial
@@ -140,6 +141,29 @@ sudo python keyboard-control.py
 | `S` | Backward |
 | `A` | Turn left |
 | `D` | Turn right |
+
+### Driving with a camera view
+
+Useful for checking the camera framing, or for driving the robot from
+another room. Two terminals, and the two halves are independent — the
+viewer only subscribes to the camera topic, and the keyboard script talks
+straight to the ESP32.
+
+```bash
+# terminal 1 — live camera, no detection
+source /opt/ros/humble/setup.bash && source ~/sensorstream_ws/install/setup.bash
+ros2 run person_follower camera_viewer
+
+# terminal 2 — manual driving
+sudo ./venv/bin/python keyboard-wifi-control.py
+```
+
+Requires Conduit to be publishing; see [Person Following](#person-following-ros-2)
+for the camera setup.
+
+> The `keyboard` library reads input globally, so W/A/S/D drive the robot
+> regardless of which window has focus — including while the camera
+> window is focused.
 
 ## Person Following (ROS 2)
 
@@ -195,16 +219,36 @@ source /opt/ros/humble/setup.bash
 source ~/sensorstream_ws/install/setup.bash
 ```
 
-**1. Start Conduit.** Open the app on the iPhone and start the
-`sensorstream_driver` node on the laptop. Confirm frames are arriving
-before going further:
+**1. Start the camera stream.** Conduit runs a ROS 2 stack on the iPhone
+and joins the laptop's ROS graph directly over DDS — there is nothing to
+launch on the laptop for the camera.
+
+In the Conduit app:
+
+- add the laptop as a **unicast peer**: its IP, port **7400**
+- set **domain ID `0`** to match the laptop (`ROS_DOMAIN_ID` unset = 0)
+- start publishing
+
+Find the laptop's IP with `hostname -I`. Both devices must be on the same
+network; a domain ID mismatch makes the two sides invisible to each other
+even when everything else is correct.
+
+Confirm the stream before going further:
 
 ```bash
+ros2 topic list
 ros2 topic hz /conduit/camera/front/image_raw/compressed
 ```
 
-Roughly 30 Hz means the camera path is healthy. If the topic exists but
-shows no rate, Conduit is not publishing — see Troubleshooting.
+Expect `/conduit/camera/front/image_raw/compressed`,
+`/conduit/camera/front/camera_info` and `/conduit/imu`, at roughly 30 Hz.
+
+If `ros2 node list` looks empty while the app says it is publishing, query
+DDS directly instead of the cached graph:
+
+```bash
+ros2 node list --no-daemon
+```
 
 **2. Power the robot and find its IP.** DHCP tends to move it:
 
@@ -214,7 +258,8 @@ shows no rate, Conduit is not publishing — see Troubleshooting.
 
 Or read it from the Arduino Serial Monitor (115200 baud) at boot.
 
-**3. Launch the follower:**
+**3. Launch the follower.** Conduit's topic names are the node defaults,
+so no remapping is needed:
 
 ```bash
 ros2 launch person_follower follow.launch.py esp_ip:=<robot-ip>
@@ -225,6 +270,10 @@ now`, and the robot starts following.
 
 Stop with Ctrl-C — the bridge sends `0,0` on exit, and the firmware also
 halts on its own after 300 ms of silence.
+
+> **Wheels up for the first run.** There is no obstacle avoidance yet, so
+> verify the robot turns toward you and drives forward when you step back
+> before putting it on the floor.
 
 ### Running nodes individually
 
@@ -281,7 +330,8 @@ ros2 bag record /conduit/camera/front/image_raw/compressed \
 
 | Symptom | Cause |
 |---|---|
-| `camera_viewer` hangs on "Waiting for frames" | Conduit is not running. `ros2 topic info <topic>` will show `Publisher count: 0`. |
+| `camera_viewer` hangs on "Waiting for frames" | Conduit is not publishing. `ros2 topic info <topic>` will show `Publisher count: 0`. |
+| `ros2 node list` empty but the app says it is publishing | Stale daemon cache — use `ros2 node list --no-daemon`. If still empty, check the domain ID matches on both sides. |
 | `Could not reach car ... No route to host` | Robot is off, or DHCP moved it. Re-run `find-robot.py`. |
 | Robot turns away from you instead of toward | `w_scale` sign — see Sign conventions below. |
 | Robot reverses when it should approach | `target_box_h` is below your actual box height. Echo `/target_person` and raise it. |
