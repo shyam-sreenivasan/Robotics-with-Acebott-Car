@@ -25,7 +25,19 @@ class CameraViewer(Node):
         super().__init__("camera_viewer")
 
         self.declare_parameter("topic", TOPIC)
+        # Conduit publishes 480x640 portrait frames even with the phone held
+        # in landscape, so the image arrives on its side. Rotating here is
+        # display-only: it does not widen the field of view.
+        # One of 0, 90, 180, 270 (degrees, counter-clockwise).
+        self.declare_parameter("rotate", 0)
+
         topic = self.get_parameter("topic").value
+        degrees = self.get_parameter("rotate").value
+        self.rotate = self._rotation_code(degrees)
+        if degrees and self.rotate is None:
+            self.get_logger().warn(
+                f"rotate:={degrees} is not one of 0/90/180/270; not rotating"
+            )
 
         # Camera frames are a live stream: BEST_EFFORT with depth 1 means we
         # always render the newest frame instead of working through a backlog
@@ -43,6 +55,16 @@ class CameraViewer(Node):
         self.get_logger().info(f"Listening on {topic}")
         self.get_logger().info("Waiting for frames... (Q or ESC to quit)")
 
+    @staticmethod
+    def _rotation_code(degrees):
+        """Map a rotation in degrees to the cv2 constant, or None for 0."""
+        return {
+            0: None,
+            90: cv2.ROTATE_90_COUNTERCLOCKWISE,
+            180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_CLOCKWISE,
+        }.get(int(degrees), None)
+
     def on_frame(self, msg):
         frame = cv2.imdecode(
             np.frombuffer(msg.data, dtype=np.uint8), cv2.IMREAD_COLOR
@@ -50,6 +72,9 @@ class CameraViewer(Node):
         if frame is None:
             self.get_logger().warn("Dropped a frame that failed to decode")
             return
+
+        if self.rotate is not None:
+            frame = cv2.rotate(frame, self.rotate)
 
         if self.frames == 0:
             h, w = frame.shape[:2]

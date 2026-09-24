@@ -158,6 +158,17 @@ ros2 run person_follower camera_viewer
 sudo ./venv/bin/python keyboard-wifi-control.py
 ```
 
+Conduit publishes 480x640 portrait frames even with the phone mounted in
+landscape, so the view arrives on its side. Rotate it for display:
+
+```bash
+ros2 run person_follower camera_viewer --ros-args -p rotate:=90
+```
+
+Accepts `0`, `90`, `180`, `270`. Use `270` if `90` comes out upside down —
+which way is up depends on the mount. This is display-only and does not
+change the field of view, which stays narrow horizontally.
+
 Requires Conduit to be publishing; see [Person Following](#person-following-ros-2)
 for the camera setup.
 
