@@ -397,6 +397,42 @@ To calibrate the follow distance: stand where you want the robot to hold
 station, run `ros2 topic echo /target_person`, and use the magnitude of
 `y` as `target_box_h`.
 
+### Pan tracking (rotate in place)
+
+For a stationary use — the robot sits on a desk during a video call and
+turns to keep whoever is in the room framed. Distance is ignored;
+`linear.x` is always 0, so it only ever rotates.
+
+```bash
+ros2 run person_follower person_tracker        # perception
+ros2 run person_follower pan_tracker           # rotate-only controller
+ros2 run person_follower acebott_bridge --ros-args \
+  -p esp_ip:=<robot-ip> -r /cmd_vel:=/follow_cmd_vel
+```
+
+On startup it sweeps one full circle, sampling a view signature every
+10°, building a map of the room. It then tracks the person; if they are
+lost it sweeps in the direction they were last heading, pauses 10s, and
+retries up to three times. After that it uses the room map to work out
+which way it is facing, turns back to the starting heading, and waits —
+resuming the moment anyone appears.
+
+The room map matters because the robot has no encoders or IMU. Without
+it, "turn back to home" is dead-reckoned from turn timing and drifts.
+Matching the live camera view against the map is closed-loop, so homing
+stays accurate however long the session runs. In a featureless room the
+match is ambiguous and the node says so rather than guessing, falling
+back to dead reckoning.
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `calibrate` | `true` | Sweep and map the room at startup |
+| `calibration_bins` | `36` | Samples per circle; 72 halves the heading error |
+| `search_attempts` | `3` | 360° sweeps before giving up |
+| `cooldown_secs` | `10.0` | Pause between sweeps |
+| `lost_after` | `1.5` | Seconds before the person counts as lost |
+| `visual_home` | `true` | `false` uses dead reckoning only |
+
 ### Why `pivot` mode
 
 All four motors share a single PWM line (see `motorMove()` in

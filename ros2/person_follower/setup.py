@@ -22,6 +22,7 @@ setup(
             "camera_viewer = person_follower.camera_viewer_node:main",
             "person_detector = person_follower.person_detector_node:main",
             "person_tracker = person_follower.person_tracker_node:main",
+            "pan_tracker = person_follower.pan_tracker_node:main",
             "follow_controller = person_follower.follow_controller_node:main",
             "acebott_bridge = person_follower.acebott_bridge_node:main",
         ],
