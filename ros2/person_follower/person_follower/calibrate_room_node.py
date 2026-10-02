@@ -1,17 +1,24 @@
 """Module 1: establish a home heading, sweep 360 degrees, return home.
 
-Runs on its own and exits with a verdict. Nothing else in the follower
-depends on it being running -- it exists to answer two questions before
-any tracking is built on top:
+Runs on its own and exits with a verdict. Three phases:
 
-  1. does a commanded sweep actually complete one full turn?
-  2. can the room map recognise the starting heading again afterwards?
+  1. SPINNING  turn continuously for ~30s and count how many times the
+               view comes back round. That measures how fast the robot
+               actually rotates on this surface, rather than trusting a
+               constant.
+  2. SWEEPING  one accurate turn using the measured rate, sampling the
+               room into heading bins.
+  3. RETURNING come home by matching the live view against that map.
 
-Both matter because the robot has no encoders or IMU. The sweep is
-open-loop (ms_per_degree, measured at 7.0 in roam.py), so question 1 is
-really "is that calibration right for this surface". Question 2 is what
-makes homing drift-free later: matching the live camera view against the
-map is closed-loop, so it does not inherit the timing error.
+Phase 1 exists because the robot has no encoders or IMU. roam.py
+assumes 7.0 ms per degree, but the true figure depends on the surface,
+battery charge and motor wear -- and a sweep built on a wrong constant
+silently covers more or less than a full circle. Counting revolutions
+with the camera measures it instead: if the view returns N times in T
+seconds, one turn took T/N.
+
+Homing (phase 3) is closed-loop on the camera, so it does not inherit
+any residual timing error.
 
 The report at the end gives a match score for the returned view against
 the startup view, where 1.0 is identical. Anything above ~0.8 means the
@@ -35,6 +42,7 @@ CMD_TOPIC = "/follow_cmd_vel"
 IMAGE_TOPIC = "/conduit/camera/front/image_raw/compressed"
 
 WAITING = "WAITING"      # no frames yet
+SPINNING = "SPINNING"    # measuring the true rotation rate
 SWEEPING = "SWEEPING"    # the 360 degree turn
 RETURNING = "RETURNING"  # homing on the map
 DONE = "DONE"
@@ -52,6 +60,16 @@ class CalibrateRoom(Node):
         self.declare_parameter("rate", 20.0)
         # Give up rather than spinning forever if homing cannot settle.
         self.declare_parameter("return_timeout", 20.0)
+        # Phase 1: spin this long, counting revolutions, to measure the
+        # true rotation rate. Longer means more revolutions and a better
+        # estimate; 30s gives roughly 10 at the default speed.
+        self.declare_parameter("spin_secs", 30.0)
+        self.declare_parameter("measure_rate", True)
+        # Correlation thresholds for counting a revolution. The view
+        # correlates ~0.8 at 2deg from home and ~0 by 10deg, so these sit
+        # comfortably inside that peak.
+        self.declare_parameter("peak_enter", 0.55)
+        self.declare_parameter("peak_exit", 0.35)
 
         g = self.get_parameter
         self.turn_speed = g("turn_speed").value
@@ -60,6 +78,10 @@ class CalibrateRoom(Node):
         self.home_tol = g("home_tolerance_deg").value
         self.rate = g("rate").value
         self.return_timeout = g("return_timeout").value
+        self.spin_secs = g("spin_secs").value
+        self.measure_rate = g("measure_rate").value
+        self.peak_enter = g("peak_enter").value
+        self.peak_exit = g("peak_exit").value
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -75,6 +97,11 @@ class CalibrateRoom(Node):
         self.home_view = None
         self.room_map = [None] * self.n_bins
         self.swept = 0.0
+        self.peaks = []          # times the view came back round
+        self._armed = False
+        self._best = -1.0
+        self._best_t = 0.0
+        self.measured_ms = None
         self.state = WAITING
         self.state_since = self.get_clock().now()
 
@@ -145,9 +172,19 @@ class CalibrateRoom(Node):
         if self.state == WAITING:
             if self.live_view is not None:
                 self.home_view = self.live_view.copy()
-                self.room_map[0] = self.home_view
-                self.get_logger().info("Home view captured. Sweeping 360deg...")
-                self._enter(SWEEPING)
+                if self.measure_rate:
+                    self.get_logger().info(
+                        f"Home view captured. Spinning {self.spin_secs:.0f}s "
+                        "to measure the rotation rate..."
+                    )
+                    self._enter(SPINNING)
+                else:
+                    self.room_map[0] = self.home_view
+                    self.get_logger().info("Home view captured. Sweeping 360deg...")
+                    self._enter(SWEEPING)
+
+        elif self.state == SPINNING:
+            w = self._do_spin()
 
         elif self.state == SWEEPING:
             w = self._do_sweep()
@@ -159,6 +196,72 @@ class CalibrateRoom(Node):
         cmd.angular.z = w
         cmd.linear.x = 0.0   # rotation only, always
         self.cmd_pub.publish(cmd)
+
+    def _do_spin(self):
+        """Turn continuously, timing each return to the starting view.
+
+        Correlation against the home view rises to a sharp peak once per
+        revolution. Each peak is logged at its maximum rather than at the
+        threshold crossing, so the timing does not depend on how steeply
+        the robot passes through.
+        """
+        t = self._elapsed()
+        c = self._correlate(self.home_view, self.live_view)
+
+        if c is not None:
+            if c >= self.peak_enter:
+                self._armed = True
+                if c > self._best:
+                    self._best, self._best_t = c, t
+            elif self._armed and c < self.peak_exit:
+                self.peaks.append(self._best_t)
+                self.get_logger().info(
+                    f"  revolution {len(self.peaks)} at {self._best_t:.1f}s "
+                    f"(peak {self._best:.2f})"
+                )
+                self._armed = False
+                self._best = -1.0
+
+        if t < self.spin_secs:
+            return self.turn_speed
+
+        # Spin over: turn the peak times into a rate.
+        if len(self.peaks) < 2:
+            self.get_logger().warn(
+                f"Only {len(self.peaks)} revolutions detected in "
+                f"{self.spin_secs:.0f}s -- keeping ms_per_degree={self.ms_per_degree}. "
+                "The room may lack distinctive features, or the robot is not turning."
+            )
+        else:
+            gaps = [b - a for a, b in zip(self.peaks, self.peaks[1:])]
+            period = sum(gaps) / len(gaps)
+            spread = max(gaps) - min(gaps)
+            measured = (period * 1000.0) / 360.0
+            # Scale to the command used while spinning, so the constant
+            # is expressed per unit of commanded turn like roam.py's.
+            self.measured_ms = measured
+
+            self.get_logger().info(
+                f"  {len(self.peaks)} revolutions, mean period {period:.2f}s "
+                f"(spread {spread:.2f}s)"
+            )
+            if spread > period * 0.25:
+                self.get_logger().warn(
+                    "  Revolution times are inconsistent -- treat the measurement "
+                    "with suspicion (missed peaks, or the robot slipped)."
+                )
+            self.get_logger().info(
+                f"  measured ms_per_degree = {measured:.2f} "
+                f"(was {self.ms_per_degree:.2f})"
+            )
+            self.ms_per_degree = measured
+
+        self.room_map[0] = self.live_view.copy()
+        self.home_view = self.room_map[0]
+        self.swept = 0.0
+        self.get_logger().info("Sweeping 360deg with the measured rate...")
+        self._enter(SWEEPING)
+        return 0.0
 
     def _do_sweep(self):
         bin_width = 360.0 / self.n_bins

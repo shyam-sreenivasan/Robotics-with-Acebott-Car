@@ -397,6 +397,47 @@ To calibrate the follow distance: stand where you want the robot to hold
 station, run `ros2 topic echo /target_person`, and use the magnitude of
 `y` as `target_box_h`.
 
+### Room calibration
+
+The first testable piece, and a prerequisite for the rest. Run it on its
+own; it reports a verdict and exits.
+
+```bash
+# terminal 1
+ros2 run person_follower acebott_bridge --ros-args \
+  -p esp_ip:=<robot-ip> -r /cmd_vel:=/follow_cmd_vel
+
+# terminal 2
+ros2 run person_follower calibrate_room
+```
+
+Three phases:
+
+1. **Spin** ~30s, counting how often the camera view comes back round.
+   That measures how fast the robot actually turns on this surface.
+2. **Sweep** one accurate circle at the measured rate, sampling the room
+   into 36 heading bins.
+3. **Return** home by matching the live view against that map.
+
+Phase 1 is the point of the exercise. The robot has no encoders or IMU,
+so every angle elsewhere is dead-reckoned from `ms_per_degree` — assumed
+to be 7.0, but it really depends on the surface, battery charge and
+motor wear. Counting revolutions with the camera measures it instead. In
+testing, a robot actually turning at 8.5 ms/deg was measured at 8.50
+against an assumed 7.0, and the corrected sweep returned home with a
+view match of 0.91 instead of 0.67.
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `spin_secs` | `30.0` | Phase 1 duration; longer gives more revolutions |
+| `measure_rate` | `true` | `false` skips phase 1 and trusts `ms_per_degree` |
+| `bins` | `36` | Heading samples per circle |
+| `ms_per_degree` | `7.0` | Starting guess, overwritten by phase 1 |
+| `turn_speed` | `0.5` | Rotation command used throughout |
+
+A warning that revolution times are inconsistent means peaks were missed
+— usually too little texture in view, or the robot slipping.
+
 ### Pan tracking (rotate in place)
 
 For a stationary use — the robot sits on a desk during a video call and
