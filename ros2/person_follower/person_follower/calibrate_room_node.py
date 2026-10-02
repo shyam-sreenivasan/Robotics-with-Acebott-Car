@@ -79,6 +79,10 @@ class CalibrateRoom(Node):
         # units per second. Too slow and an early high score keeps the
         # gate above every later peak.
         self.declare_parameter("ceiling_decay", 0.08)
+        # Shortest believable time for one revolution, in seconds. The
+        # robot physically cannot spin faster than this, so anything
+        # sooner is a false peak rather than a lap.
+        self.declare_parameter("min_period", 1.5)
         # Write the captured bins out as one strip image, so you can see
         # what the robot saw at each heading and judge whether the room
         # has enough distinct texture for homing to work.
@@ -97,6 +101,7 @@ class CalibrateRoom(Node):
         self.peak_exit = g("peak_exit").value
         self.match_sigma = g("match_sigma").value
         self._ceiling_decay = g("ceiling_decay").value
+        self.min_period = g("min_period").value
         self.map_image_path = g("save_map_image").value
 
         qos = QoSProfile(
@@ -262,14 +267,32 @@ class CalibrateRoom(Node):
                 ceiling = max(c, ceiling - self._ceiling_decay / self.rate)
             self._ceiling = ceiling
 
-            enter = max(self.peak_enter * ceiling, 0.25)
-            leave = max(self.peak_exit * ceiling, 0.12)
+            enter = max(self.peak_enter * ceiling, 0.40)
+            leave = max(self.peak_exit * ceiling, 0.25)
 
             if c >= enter:
                 self._armed = True
                 if c > self._best:
                     self._best, self._best_t = c, t
             elif self._armed and c < leave:
+                # Refractory gate: a genuine revolution cannot arrive
+                # sooner than this. Without it, ordinary scene variation
+                # crossing a low threshold is counted as a revolution --
+                # observed on hardware as 25 "revolutions" in 30s with
+                # gaps as short as 0.4s, which halved the measured rate.
+                too_soon = (
+                    self.peaks and
+                    self._best_t - self.peaks[-1] < self.min_period
+                )
+                if too_soon:
+                    # Keep whichever candidate matched better.
+                    if self._best > getattr(self, "_last_peak_score", 0.0):
+                        self.peaks[-1] = self._best_t
+                        self._last_peak_score = self._best
+                    self._armed = False
+                    self._best = -1.0
+                    return self.turn_speed
+                self._last_peak_score = self._best
                 self.peaks.append(self._best_t)
                 self.get_logger().info(
                     f"  revolution {len(self.peaks)} at {self._best_t:.1f}s "
@@ -282,11 +305,18 @@ class CalibrateRoom(Node):
             return self.turn_speed
 
         # Spin over: turn the peak times into a rate.
-        # Two peaks give a single gap, and a single gap cannot be
-        # cross-checked -- if a peak was missed between them it is read
-        # as one slow revolution instead of two normal ones, inflating
-        # the rate. Four gives enough gaps to spot that.
-        if len(self.peaks) < 4:
+        #
+        # Peaks are only trustworthy if they are periodic -- real
+        # revolutions land on multiples of one period, false ones land
+        # anywhere. Rather than averaging gaps (which a single missed or
+        # spurious peak skews badly), find the period that best explains
+        # the peak times, then check how cleanly it does so. If the
+        # peaks are not convincingly periodic the measurement is refused
+        # outright: a wrong rate is worse than the default, because it
+        # silently makes every later sweep cover the wrong arc.
+        period, quality, explained = self._fit_period(self.peaks)
+
+        if period is None:
             self.get_logger().warn(
                 f"Only {len(self.peaks)} peaks in {self.spin_secs:.0f}s -- too few "
                 f"to measure from. Keeping ms_per_degree={self.ms_per_degree:.2f}."
@@ -295,41 +325,25 @@ class CalibrateRoom(Node):
                 "  Lower peak_enter (try 0.35) if the view degrades as the "
                 "robot drifts, or raise spin_secs for more revolutions."
             )
+        elif quality > 0.12:
+            self.get_logger().warn(
+                f"  {len(self.peaks)} peaks, but they are not cleanly periodic "
+                f"(best period {period:.2f}s explains only "
+                f"{explained}/{len(self.peaks)}, scatter {quality:.2f})."
+            )
+            self.get_logger().warn(
+                f"  Refusing to measure; keeping ms_per_degree="
+                f"{self.ms_per_degree:.2f}. The robot is probably drifting off "
+                "its pivot so the view never repeats cleanly, or the room has "
+                "repeating features."
+            )
         else:
-            gaps = sorted(b - a for a, b in zip(self.peaks, self.peaks[1:]))
-            # The median resists the main failure mode: a missed peak
-            # merges two revolutions into one gap of roughly double
-            # length, which would drag a mean upwards.
-            mid = len(gaps) // 2
-            period = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
-
-            # Fold obvious multiples back down. A gap close to 2x or 3x
-            # the median is that many revolutions with peaks missed in
-            # between, so it still carries good timing information.
-            folded = []
-            for g in gaps:
-                n = max(1, round(g / period))
-                if abs(g - n * period) <= 0.25 * period:
-                    folded.append(g / n)
-            if folded:
-                period = sum(folded) / len(folded)
-
-            missed = sum(1 for g in gaps if round(g / period) > 1)
-            spread = max(folded) - min(folded) if folded else 0.0
             measured = (period * 1000.0) / 360.0
             self.measured_ms = measured
-
             self.get_logger().info(
                 f"  {len(self.peaks)} peaks, period {period:.2f}s "
-                f"(spread {spread:.2f}s"
-                + (f", {missed} gap(s) held a missed peak)" if missed else ")")
+                f"({explained} fit it, scatter {quality:.2f})"
             )
-            if spread > period * 0.25:
-                self.get_logger().warn(
-                    "  Revolution times are inconsistent even after allowing "
-                    "for missed peaks -- the robot may be slipping, or the "
-                    "view may be changing as it turns."
-                )
             self.get_logger().info(
                 f"  measured ms_per_degree = {measured:.2f} "
                 f"(was {self.ms_per_degree:.2f})"
@@ -342,6 +356,34 @@ class CalibrateRoom(Node):
         self.get_logger().info("Sweeping 360deg with the measured rate...")
         self._enter(SWEEPING)
         return 0.0
+
+    def _fit_period(self, peaks):
+        """Best period for these peak times, plus how well it fits.
+
+        Returns (period, scatter, n_explained). Scatter is the mean
+        distance from a peak to its nearest multiple of the period, as a
+        fraction of the period -- near 0 for clean data, large when the
+        peaks are not really periodic. A period is only accepted if it
+        explains most of the peaks, so a short period cannot win simply
+        by fitting noise.
+        """
+        if len(peaks) < 4:
+            return None, 1.0, 0
+
+        span = peaks[-1] - peaks[0]
+        best = (None, 1.0, 0)
+        p = self.min_period
+        while p <= span / 3.0:
+            errs = [abs(t - round(t / p) * p) for t in peaks]
+            fit = [e for e in errs if e <= 0.3 * p]
+            # Demand that most peaks fit, so noise cannot be explained
+            # away by choosing a very short period.
+            if len(fit) >= max(4, int(0.75 * len(peaks))):
+                scatter = (sum(fit) / len(fit)) / p
+                if scatter < best[1]:
+                    best = (p, scatter, len(fit))
+            p += 0.01
+        return best
 
     def _do_sweep(self):
         bin_width = 360.0 / self.n_bins
