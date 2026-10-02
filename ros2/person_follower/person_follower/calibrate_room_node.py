@@ -75,6 +75,10 @@ class CalibrateRoom(Node):
         # usable here because the robot drifts as it turns; see
         # _heading_from_map.
         self.declare_parameter("match_sigma", 3.0)
+        # How fast the peak-detection ceiling decays, in correlation
+        # units per second. Too slow and an early high score keeps the
+        # gate above every later peak.
+        self.declare_parameter("ceiling_decay", 0.08)
         # Write the captured bins out as one strip image, so you can see
         # what the robot saw at each heading and judge whether the room
         # has enough distinct texture for homing to work.
@@ -92,6 +96,7 @@ class CalibrateRoom(Node):
         self.peak_enter = g("peak_enter").value
         self.peak_exit = g("peak_exit").value
         self.match_sigma = g("match_sigma").value
+        self._ceiling_decay = g("ceiling_decay").value
         self.map_image_path = g("save_map_image").value
 
         qos = QoSProfile(
@@ -242,13 +247,23 @@ class CalibrateRoom(Node):
         c = self._correlate(self.home_view, self.live_view)
 
         if c is not None:
-            # Track the running maximum and gate relative to it. The view
-            # drifts as the robot turns -- tilt, exposure, a person moving
-            # -- so later revolutions peak lower than the first, and a
-            # fixed threshold starts missing them entirely.
-            self._ceiling = max(getattr(self, "_ceiling", 0.0), c)
-            enter = max(self.peak_enter * self._ceiling, 0.3)
-            leave = max(self.peak_exit * self._ceiling, 0.15)
+            # Gate relative to a DECAYING ceiling. The first revolution
+            # often matches near 1.0 because nothing has moved yet, while
+            # later ones peak far lower as the robot drifts off its pivot.
+            # A plain running maximum locks the gate to that first score
+            # and then rejects every real peak after it -- observed on
+            # hardware as 2 detections in 30s where there should be ~12.
+            # Decaying lets the threshold follow the view as it degrades.
+            ceiling = getattr(self, "_ceiling", None)
+            if ceiling is None:
+                ceiling = c
+            else:
+                # Fall slowly, rise immediately.
+                ceiling = max(c, ceiling - self._ceiling_decay / self.rate)
+            self._ceiling = ceiling
+
+            enter = max(self.peak_enter * ceiling, 0.25)
+            leave = max(self.peak_exit * ceiling, 0.12)
 
             if c >= enter:
                 self._armed = True
@@ -267,11 +282,18 @@ class CalibrateRoom(Node):
             return self.turn_speed
 
         # Spin over: turn the peak times into a rate.
-        if len(self.peaks) < 2:
+        # Two peaks give a single gap, and a single gap cannot be
+        # cross-checked -- if a peak was missed between them it is read
+        # as one slow revolution instead of two normal ones, inflating
+        # the rate. Four gives enough gaps to spot that.
+        if len(self.peaks) < 4:
             self.get_logger().warn(
-                f"Only {len(self.peaks)} revolutions detected in "
-                f"{self.spin_secs:.0f}s -- keeping ms_per_degree={self.ms_per_degree}. "
-                "The room may lack distinctive features, or the robot is not turning."
+                f"Only {len(self.peaks)} peaks in {self.spin_secs:.0f}s -- too few "
+                f"to measure from. Keeping ms_per_degree={self.ms_per_degree:.2f}."
+            )
+            self.get_logger().warn(
+                "  Lower peak_enter (try 0.35) if the view degrades as the "
+                "robot drifts, or raise spin_secs for more revolutions."
             )
         else:
             gaps = sorted(b - a for a, b in zip(self.peaks, self.peaks[1:]))
