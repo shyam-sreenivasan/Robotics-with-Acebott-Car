@@ -209,11 +209,19 @@ class CalibrateRoom(Node):
         c = self._correlate(self.home_view, self.live_view)
 
         if c is not None:
-            if c >= self.peak_enter:
+            # Track the running maximum and gate relative to it. The view
+            # drifts as the robot turns -- tilt, exposure, a person moving
+            # -- so later revolutions peak lower than the first, and a
+            # fixed threshold starts missing them entirely.
+            self._ceiling = max(getattr(self, "_ceiling", 0.0), c)
+            enter = max(self.peak_enter * self._ceiling, 0.3)
+            leave = max(self.peak_exit * self._ceiling, 0.15)
+
+            if c >= enter:
                 self._armed = True
                 if c > self._best:
                     self._best, self._best_t = c, t
-            elif self._armed and c < self.peak_exit:
+            elif self._armed and c < leave:
                 self.peaks.append(self._best_t)
                 self.get_logger().info(
                     f"  revolution {len(self.peaks)} at {self._best_t:.1f}s "
@@ -233,22 +241,39 @@ class CalibrateRoom(Node):
                 "The room may lack distinctive features, or the robot is not turning."
             )
         else:
-            gaps = [b - a for a, b in zip(self.peaks, self.peaks[1:])]
-            period = sum(gaps) / len(gaps)
-            spread = max(gaps) - min(gaps)
+            gaps = sorted(b - a for a, b in zip(self.peaks, self.peaks[1:]))
+            # The median resists the main failure mode: a missed peak
+            # merges two revolutions into one gap of roughly double
+            # length, which would drag a mean upwards.
+            mid = len(gaps) // 2
+            period = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+
+            # Fold obvious multiples back down. A gap close to 2x or 3x
+            # the median is that many revolutions with peaks missed in
+            # between, so it still carries good timing information.
+            folded = []
+            for g in gaps:
+                n = max(1, round(g / period))
+                if abs(g - n * period) <= 0.25 * period:
+                    folded.append(g / n)
+            if folded:
+                period = sum(folded) / len(folded)
+
+            missed = sum(1 for g in gaps if round(g / period) > 1)
+            spread = max(folded) - min(folded) if folded else 0.0
             measured = (period * 1000.0) / 360.0
-            # Scale to the command used while spinning, so the constant
-            # is expressed per unit of commanded turn like roam.py's.
             self.measured_ms = measured
 
             self.get_logger().info(
-                f"  {len(self.peaks)} revolutions, mean period {period:.2f}s "
-                f"(spread {spread:.2f}s)"
+                f"  {len(self.peaks)} peaks, period {period:.2f}s "
+                f"(spread {spread:.2f}s"
+                + (f", {missed} gap(s) held a missed peak)" if missed else ")")
             )
             if spread > period * 0.25:
                 self.get_logger().warn(
-                    "  Revolution times are inconsistent -- treat the measurement "
-                    "with suspicion (missed peaks, or the robot slipped)."
+                    "  Revolution times are inconsistent even after allowing "
+                    "for missed peaks -- the robot may be slipping, or the "
+                    "view may be changing as it turns."
                 )
             self.get_logger().info(
                 f"  measured ms_per_degree = {measured:.2f} "
